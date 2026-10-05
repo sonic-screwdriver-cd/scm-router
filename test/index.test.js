@@ -19,6 +19,7 @@ describe('index test', () => {
     let scmGithub;
     let scmGitlab;
     let exampleScm;
+    let loggerMock;
     const githubPluginOptions = {
         oauthClientId: 'OAUTH_CLIENT_ID',
         oauthClientSecret: 'OAUTH_CLIENT_SECRET',
@@ -85,15 +86,22 @@ describe('index test', () => {
             useCleanCache: true,
             warnOnUnregistered: false
         });
+        loggerMock = {
+            info: sinon.stub(),
+            warn: sinon.stub(),
+            error: sinon.stub()
+        };
     });
 
     beforeEach(() => {
+        Object.values(loggerMock).forEach(stub => stub.resetHistory());
         githubScmMock = initMock('github');
         githubScmMock.canHandleWebhook.resolves(false);
         gitlabScmMock = initMock('gitlab');
         exampleScmMock = initMock('example');
 
         mockery.registerMock('screwdriver-scm-base', testScm.getBaseClass());
+        mockery.registerMock('screwdriver-logger', loggerMock);
         mockery.registerMock('screwdriver-scm-github', testScm.createMock(githubScmMock));
         mockery.registerMock('screwdriver-scm-gitlab', testScm.createMock(gitlabScmMock));
         mockery.registerMock('screwdriver-scm-example', testScm.createMock(exampleScmMock));
@@ -636,18 +644,44 @@ describe('index test', () => {
             }));
 
         it('rejects error when all scm cannot parse the webhook', () => {
+            const noMatchHeaders = {
+                'x-github-delivery': 'delivery\n1',
+                'x-github-event': 'pull_request'
+            };
+            const noMatchPayload = JSON.stringify({
+                action: 'opened\n',
+                repository: { full_name: 'org/repo\n' },
+                secret: 'must-not-be-logged'
+            });
+
             scmGithub.canHandleWebhook.resolves(false);
             scmGitlab.canHandleWebhook.resolves(false);
             exampleScm.canHandleWebhook.resolves(false);
 
             return scm
-                ._parseHook(headers, payload)
+                ._parseHook(noMatchHeaders, noMatchPayload)
                 .then(() => {
                     assert.fail('This should not fail the tests');
                 })
                 .catch(err => {
+                    const finalLogCall = loggerMock.info
+                        .getCalls()
+                        .find(call => call.args[0] === 'Webhook does not match any expected events or actions.');
+
                     assert.include(err.message, 'Cannot parse this webhook');
                     assert.strictEqual(err.statusCode, 400);
+                    assert.strictEqual(err.reasonCode, 'SCM_ROUTER_NO_MATCH');
+                    assert.isOk(finalLogCall);
+                    assert.deepInclude(finalLogCall.args[1], {
+                        reasonCode: 'SCM_ROUTER_NO_MATCH',
+                        decision: 'final',
+                        candidateCount: 3,
+                        deliveryId: 'delivery1',
+                        event: 'pull_request',
+                        action: 'opened',
+                        unverifiedRepository: 'org/repo'
+                    });
+                    assert.notMatch(JSON.stringify(finalLogCall.args), /must-not-be-logged/);
                     assert.notCalled(scmGithub.parseHook);
                     assert.notCalled(scmGitlab.parseHook);
                     assert.notCalled(exampleScm.parseHook);

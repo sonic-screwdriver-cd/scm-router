@@ -8,6 +8,63 @@ const logger = require('screwdriver-logger');
 const REQUEST_CACHE_STORAGE_KEY = Symbol.for('sd.requestCacheStorage');
 
 /**
+ * Sanitize an untrusted webhook value before including it in structured logs.
+ * @param  {*}      value     Candidate value
+ * @param  {Number} maxLength Maximum output length
+ * @returns {String|undefined} Sanitized value
+ */
+function sanitizeWebhookLogValue(value, maxLength = 256) {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+
+    return (
+        Array.from(value)
+            .filter(char => {
+                const codePoint = char.codePointAt(0);
+
+                return codePoint > 0x1f && codePoint !== 0x7f;
+            })
+            .join('')
+            .slice(0, maxLength) || undefined
+    );
+}
+
+/**
+ * Build safe correlation fields without logging the payload or signature.
+ * Payload-derived values are explicitly unverified at this routing stage.
+ * @param  {Object} headers Webhook request headers
+ * @param  {String} payload Raw webhook payload
+ * @returns {Object} Safe structured log context
+ */
+function getWebhookLogContext(headers, payload) {
+    const context = {
+        deliveryId: sanitizeWebhookLogValue(
+            headers['x-github-delivery'] || headers['x-gitlab-event-uuid'] || headers['x-request-uuid'],
+            128
+        ),
+        event: sanitizeWebhookLogValue(
+            headers['x-github-event'] || headers['x-gitlab-event'] || headers['x-event-key'],
+            128
+        )
+    };
+
+    try {
+        const parsedPayload = JSON.parse(payload);
+
+        context.action = sanitizeWebhookLogValue(parsedPayload.action, 128);
+        context.unverifiedRepository = sanitizeWebhookLogValue(
+            hoek.reach(parsedPayload, 'repository.full_name') ||
+                hoek.reach(parsedPayload, 'project.path_with_namespace')
+        );
+    } catch (err) {
+        // A provider plugin classifies invalid payloads. Never include the raw payload here.
+    }
+
+    return context;
+}
+
+/**
  * Get the request-local cache storage instance.
  * @returns {AsyncLocalStorage<Map<string, Promise<*>>>} Async local storage for request cache entries
  */
@@ -117,6 +174,8 @@ class ScmRouter extends Scm {
      * @return {Promise}                     scm object
      */
     chooseWebhookScm(headers, payload) {
+        const webhookLogContext = getWebhookLogContext(headers, payload);
+
         return new Promise(resolve => {
             // choose a webhook scm module, or null if there is no suitable one
             async.detect(
@@ -124,10 +183,24 @@ class ScmRouter extends Scm {
                 (scm, cb) => {
                     scm.canHandleWebhook(headers, payload)
                         .then(result => {
+                            if (result === false) {
+                                logger.info('SCM webhook candidate did not match', {
+                                    reasonCode: 'SCM_CANDIDATE_NO_MATCH',
+                                    decision: 'candidate',
+                                    scmContext: scm.getScmContexts()[0],
+                                    ...webhookLogContext
+                                });
+                            }
                             cb(result === false ? null : scm);
                         })
                         .catch(err => {
-                            logger.error(err);
+                            logger.error('SCM webhook candidate failed', {
+                                reasonCode: 'SCM_CANDIDATE_ERROR',
+                                decision: 'candidate',
+                                scmContext: scm.getScmContexts()[0],
+                                statusCode: err.statusCode,
+                                ...webhookLogContext
+                            });
                             cb(null);
                         });
                 },
@@ -233,13 +306,19 @@ class ScmRouter extends Scm {
     _parseHook(headers, payload) {
         return this.chooseWebhookScm(headers, payload).then(scm => {
             if (!scm) {
-                logger.info('Webhook does not match any expected events or actions.');
+                logger.info('Webhook does not match any expected events or actions.', {
+                    reasonCode: 'SCM_ROUTER_NO_MATCH',
+                    decision: 'final',
+                    candidateCount: Object.keys(this.scms).length,
+                    ...getWebhookLogContext(headers, payload)
+                });
 
                 const err = new Error(
                     'Cannot parse this webhook. Please ensure that the signature is correct or that this SCM is supported.'
                 );
 
                 err.statusCode = 400;
+                err.reasonCode = 'SCM_ROUTER_NO_MATCH';
 
                 return Promise.reject(err);
             }
